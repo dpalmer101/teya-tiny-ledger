@@ -44,6 +44,10 @@ func (h *Handler) RegisterRoutes(mux Mux) {
 	mux.HandleFunc("GET /accounts/{id}/balance", h.getBalance)
 	mux.HandleFunc("POST /accounts/{id}/transactions", h.idempotency.Wrap(h.addTransaction))
 	mux.HandleFunc("GET /accounts/{id}/transactions", h.listTransactions)
+
+	mux.HandleFunc("POST /accounts/{id}/begin", h.beginTransactionSession)
+	mux.HandleFunc("POST /accounts/{id}/commit", h.commitTransactionSession)
+	mux.HandleFunc("POST /accounts/{id}/rollback", h.rollbackTransactionSession)
 }
 
 // --- request / response types ---
@@ -65,7 +69,7 @@ type balanceResponse struct {
 }
 
 type transactionListResponse struct {
-	AccountID    string               `json:"account_id"`
+	AccountID    string              `json:"account_id"`
 	Transactions []store.Transaction `json:"transactions"`
 	// NextCursor is the ID of the oldest transaction on the current page.
 	NextCursor string `json:"next_cursor,omitempty"`
@@ -235,6 +239,39 @@ func (h *Handler) listTransactions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (h *Handler) beginTransactionSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+
+	err := h.store.BeginTransactionSession(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, nil)
+}
+
+func (h *Handler) commitTransactionSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+
+	err := h.store.CommitTransactionSession(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, nil)
+}
+
+func (h *Handler) rollbackTransactionSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+
+	err := h.store.RollbackTransactionSession(id)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, nil)
+}
+
 // --- helpers ---
 
 func writeError(w http.ResponseWriter, err error) {
@@ -249,6 +286,10 @@ func writeError(w http.ResponseWriter, err error) {
 		writeErrorString(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, store.ErrCurrencyMismatch):
 		writeErrorString(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, store.ErrTransactionSessionAlreadyExists):
+		writeErrorString(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrTransactionSessionDoesNotExist):
+		writeErrorString(w, http.StatusConflict, err.Error())
 	default:
 		writeErrorString(w, http.StatusInternalServerError, "internal server error")
 	}
@@ -270,4 +311,3 @@ func validCurrency(s string) bool {
 	}
 	return true
 }
-

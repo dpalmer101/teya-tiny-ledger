@@ -19,6 +19,7 @@ All errors return the same envelope:
 | `400 Bad Request` | Missing or invalid field in the request body |
 | `404 Not Found` | Account ID does not exist |
 | `415 Unsupported Media Type` | `POST` request missing `Content-Type: application/json` |
+| `409 Conflict` | Transaction session state conflict — begin when a session is already open, or commit/rollback when no session is open |
 | `422 Unprocessable Entity` | Transaction would overflow the account balance, or currency does not match the account |
 | `500 Internal Server Error` | Unexpected server error — used for any store error that is not a known sentinel. Not expected in normal operation with the in-memory backend; a future persistence backend may return 500 for I/O failures. Extremely rare OS-level failures (e.g. `crypto/rand` unavailability) could also produce a 500. |
 
@@ -260,3 +261,107 @@ GET /accounts/4a2f1b3c-.../transactions?limit=2&after=7c9e2d1a-3f5b-4e8c-a2d0-1b
 When the last page is returned, `next_cursor` is omitted. If `limit` is not supplied at all, `next_cursor` is never set — pagination requires an explicit `limit`.
 
 **Note on cursor + date filter interaction:** `next_cursor` is the ID of the oldest transaction on the current page. If you pass this cursor alongside a `since` or `until` filter on the next request, the cursor establishes the starting position first and the date filter is then applied to the remaining items. This can produce an empty result if the cursor transaction sits at the `since` boundary — this is expected behaviour, not an error.
+
+---
+
+## Transaction sessions
+
+A transaction session allows multiple transactions to be staged and then applied atomically. While a session is open, staged transactions are not visible in the balance or transaction list. On commit, all staged transactions are applied together; on rollback, they are discarded.
+
+Sessions are scoped to a single account. Only one session may be open per account at a time.
+
+### Begin a session
+
+```
+POST /accounts/{id}/begin
+```
+
+Opens a transaction session for the account. All subsequent calls to [Record a transaction](#record-a-transaction) on this account will be staged rather than applied immediately.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`** — empty body.
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | Account ID does not exist |
+| `409 Conflict` | A session is already open for this account |
+
+---
+
+### Commit a session
+
+```
+POST /accounts/{id}/commit
+```
+
+Atomically applies all staged transactions. The balance and transaction list are updated together. If any staged transaction would overflow the balance, the entire commit is rejected and no transactions are applied.
+
+After a successful commit the session is closed and a new session may be opened.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`** — empty body.
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | Account ID does not exist |
+| `409 Conflict` | No session is open for this account |
+| `422 Unprocessable Entity` | One or more staged transactions would overflow the balance; the session remains open |
+
+---
+
+### Rollback a session
+
+```
+POST /accounts/{id}/rollback
+```
+
+Discards all staged transactions. The account balance and transaction list are unchanged. After rollback the session is closed and a new session may be opened.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`** — empty body.
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `404 Not Found` | Account ID does not exist |
+| `409 Conflict` | No session is open for this account |
+
+---
+
+### Example flow
+
+```
+POST /accounts/4a2f1b3c-.../begin           → 200
+
+POST /accounts/4a2f1b3c-.../transactions    → 201  (staged, not yet visible)
+{ "amount": 500, "currency": "GBP", "transaction_date": "2024-01-15T10:00:00Z" }
+
+POST /accounts/4a2f1b3c-.../transactions    → 201  (staged, not yet visible)
+{ "amount": -100, "currency": "GBP", "transaction_date": "2024-01-15T10:01:00Z" }
+
+GET  /accounts/4a2f1b3c-.../balance         → 200  { "balance": 0 }  ← unchanged
+
+POST /accounts/4a2f1b3c-.../commit          → 200
+
+GET  /accounts/4a2f1b3c-.../balance         → 200  { "balance": 400 }  ← both applied
+```

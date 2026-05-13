@@ -20,6 +20,12 @@ type accountData struct {
 	transactions []*Transaction
 	balance      int64
 	txLookup     map[string]*Transaction
+
+	transactionSession *transactionSession
+}
+
+type transactionSession struct {
+	transactions []*Transaction
 }
 
 // MemoryStore is an in-memory implementation of Store.
@@ -85,19 +91,12 @@ func (s *MemoryStore) AddTransaction(accountID string, input NewTransaction) (Tr
 	now := time.Now().UTC()
 	txDate := input.TransactionDate.UTC()
 
-	data.mu.Lock()
-	defer data.mu.Unlock()
-
 	if input.Currency != data.account.Currency {
 		return Transaction{}, ErrCurrencyMismatch
 	}
 
-	// Guard against overflow/underflow.
-	bal := data.balance
-	newBalance := bal + input.Amount
-	if (input.Amount > 0 && newBalance < bal) || (input.Amount < 0 && newBalance > bal) {
-		return Transaction{}, ErrBalanceOverflow
-	}
+	data.mu.Lock()
+	defer data.mu.Unlock()
 
 	tx := &Transaction{
 		ID:              id,
@@ -109,20 +108,36 @@ func (s *MemoryStore) AddTransaction(accountID string, input NewTransaction) (Tr
 		CreatedAt:       now,
 	}
 
+	if data.transactionSession == nil {
+		// Guard against overflow/underflow.
+		bal := data.balance
+		newBalance := bal + tx.Amount
+		if (tx.Amount > 0 && newBalance < bal) || (tx.Amount < 0 && newBalance > bal) {
+			return Transaction{}, ErrBalanceOverflow
+		}
+
+		data.balance = newBalance
+		return *tx, s.commitTransaction(data, tx)
+	}
+
+	data.transactionSession.transactions = append(data.transactionSession.transactions, tx)
+	return *tx, nil
+}
+
+func (s *MemoryStore) commitTransaction(data *accountData, tx *Transaction) error {
 	// Insert in TransactionDate order. Binary search finds the insertion point
 	// in O(log n); the element shift is O(n) but unavoidable for a slice store.
 	txs := data.transactions
 	i := sort.Search(len(txs), func(i int) bool {
-		return txs[i].TransactionDate.After(txDate)
+		return txs[i].TransactionDate.After(tx.TransactionDate)
 	})
 	txs = append(txs, nil)
 	copy(txs[i+1:], txs[i:])
 	txs[i] = tx
 	data.transactions = txs
 	data.txLookup[tx.ID] = tx
-	data.balance = newBalance
 
-	return *tx, nil
+	return nil
 }
 
 func (s *MemoryStore) ListTransactions(accountID string, q TransactionQuery) ([]Transaction, error) {
@@ -212,4 +227,80 @@ func (s *MemoryStore) ListTransactions(accountID string, q TransactionQuery) ([]
 		}
 	}
 	return out, nil
+}
+
+func (s *MemoryStore) BeginTransactionSession(accountID string) error {
+	s.mu.RLock()
+	data, ok := s.accounts[accountID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrAccountNotFound
+	}
+
+	data.mu.Lock()
+	defer data.mu.Unlock()
+
+	if data.transactionSession != nil {
+		return ErrTransactionSessionAlreadyExists
+	}
+
+	data.transactionSession = &transactionSession{}
+
+	return nil
+}
+
+func (s *MemoryStore) CommitTransactionSession(accountID string) error {
+	s.mu.RLock()
+	data, ok := s.accounts[accountID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrAccountNotFound
+	}
+
+	data.mu.Lock()
+	defer data.mu.Unlock()
+
+	if data.transactionSession == nil {
+		return ErrTransactionSessionDoesNotExist
+	}
+
+	runningBalance := data.balance
+	for _, tx := range data.transactionSession.transactions {
+		// Guard against overflow/underflow
+		newBalance := runningBalance + tx.Amount
+		if (tx.Amount > 0 && newBalance < runningBalance) || (tx.Amount < 0 && newBalance > runningBalance) {
+			return ErrBalanceOverflow
+		}
+
+		runningBalance = newBalance
+	}
+
+	for _, tx := range data.transactionSession.transactions {
+		s.commitTransaction(data, tx)
+	}
+
+	data.balance = runningBalance
+	data.transactionSession = nil
+
+	return nil
+}
+
+func (s *MemoryStore) RollbackTransactionSession(accountID string) error {
+	s.mu.RLock()
+	data, ok := s.accounts[accountID]
+	s.mu.RUnlock()
+	if !ok {
+		return ErrAccountNotFound
+	}
+
+	data.mu.Lock()
+	defer data.mu.Unlock()
+
+	if data.transactionSession == nil {
+		return ErrTransactionSessionDoesNotExist
+	}
+
+	data.transactionSession = nil
+
+	return nil
 }

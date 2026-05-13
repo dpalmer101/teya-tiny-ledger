@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"ledger/internal/store"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // setup creates a fresh store and one account.
@@ -566,4 +568,64 @@ func TestAddTransaction_ConcurrentDifferentAccounts(t *testing.T) {
 	if balB != -n {
 		t.Errorf("account B balance = %d, want %d", balB, -n)
 	}
+}
+
+func TestTransactionSession_Commit(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 100, TransactionDate: time.Now()})
+
+	err := s.BeginTransactionSession(acc.ID)
+	if err != nil {
+		t.Fatalf("BeginTransactionSession: %v", err)
+	}
+
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 200, TransactionDate: time.Now()})
+
+	bal, err := s.GetBalance(acc.ID)
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+
+	assert.Equal(t, bal, int64(100))
+
+	s.CommitTransactionSession(acc.ID)
+
+	bal, err = s.GetBalance(acc.ID)
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+
+	assert.Equal(t, bal, int64(300))
+}
+
+func TestTransactionSession_Rollback(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 100, TransactionDate: time.Now()})
+
+	err := s.BeginTransactionSession(acc.ID)
+	if err != nil {
+		t.Fatalf("BeginTransactionSession: %v", err)
+	}
+
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 200, TransactionDate: time.Now()})
+
+	bal, err := s.GetBalance(acc.ID)
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+
+	assert.Equal(t, bal, int64(100))
+
+	s.RollbackTransactionSession(acc.ID)
+
+	bal, err = s.GetBalance(acc.ID)
+	if err != nil {
+		t.Fatalf("GetBalance: %v", err)
+	}
+
+	assert.Equal(t, bal, int64(100))
 }
