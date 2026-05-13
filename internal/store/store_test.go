@@ -567,3 +567,191 @@ func TestAddTransaction_ConcurrentDifferentAccounts(t *testing.T) {
 		t.Errorf("account B balance = %d, want %d", balB, -n)
 	}
 }
+
+// ---- Transaction sessions ------------------------------------------------
+
+func TestSession_BeginErrors(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	t.Run("unknown account", func(t *testing.T) {
+		err := s.BeginSession("no-such-account")
+		if !errors.Is(err, store.ErrAccountNotFound) {
+			t.Errorf("err = %v, want ErrAccountNotFound", err)
+		}
+	})
+
+	t.Run("already open", func(t *testing.T) {
+		if err := s.BeginSession(acc.ID); err != nil {
+			t.Fatalf("first begin: %v", err)
+		}
+		if err := s.BeginSession(acc.ID); !errors.Is(err, store.ErrSessionAlreadyOpen) {
+			t.Errorf("second begin: err = %v, want ErrSessionAlreadyOpen", err)
+		}
+		s.RollbackSession(acc.ID) // clean up
+	})
+}
+
+func TestSession_CommitAndRollbackWithNoSession(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	for _, name := range []string{"commit", "rollback"} {
+		t.Run(name, func(t *testing.T) {
+			var err error
+			if name == "commit" {
+				err = s.CommitSession(acc.ID)
+			} else {
+				err = s.RollbackSession(acc.ID)
+			}
+			if !errors.Is(err, store.ErrNoSessionOpen) {
+				t.Errorf("err = %v, want ErrNoSessionOpen", err)
+			}
+		})
+	}
+}
+
+func TestSession_BufferedTransactionsHiddenBeforeCommit(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 100, TransactionDate: time.Now()})
+
+	s.BeginSession(acc.ID)
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 200, TransactionDate: time.Now()})
+
+	bal, _ := s.GetBalance(acc.ID)
+	if bal != 100 {
+		t.Errorf("balance during session = %d, want 100", bal)
+	}
+
+	txs, _ := s.ListTransactions(acc.ID, store.TransactionQuery{})
+	if len(txs) != 1 {
+		t.Errorf("transaction count during session = %d, want 1", len(txs))
+	}
+}
+
+func TestSession_CommitAppliesAll(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 100, TransactionDate: time.Now()})
+
+	s.BeginSession(acc.ID)
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 200, TransactionDate: time.Now()})
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: -50, TransactionDate: time.Now()})
+
+	if err := s.CommitSession(acc.ID); err != nil {
+		t.Fatalf("CommitSession: %v", err)
+	}
+
+	bal, _ := s.GetBalance(acc.ID)
+	if bal != 250 {
+		t.Errorf("balance after commit = %d, want 250", bal)
+	}
+
+	txs, _ := s.ListTransactions(acc.ID, store.TransactionQuery{})
+	if len(txs) != 3 {
+		t.Errorf("transaction count after commit = %d, want 3", len(txs))
+	}
+}
+
+func TestSession_RollbackDiscardsAll(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 100, TransactionDate: time.Now()})
+
+	s.BeginSession(acc.ID)
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 200, TransactionDate: time.Now()})
+
+	if err := s.RollbackSession(acc.ID); err != nil {
+		t.Fatalf("RollbackSession: %v", err)
+	}
+
+	bal, _ := s.GetBalance(acc.ID)
+	if bal != 100 {
+		t.Errorf("balance after rollback = %d, want 100", bal)
+	}
+
+	txs, _ := s.ListTransactions(acc.ID, store.TransactionQuery{})
+	if len(txs) != 1 {
+		t.Errorf("transaction count after rollback = %d, want 1", len(txs))
+	}
+}
+
+func TestSession_CommitOverflowLeavesSessionOpen(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	// Fill to MaxInt64 - 1 via direct transactions.
+	const big = 1_000_000_000_000_000
+	target := int64(9_223_372_036_854_775_806)
+	for target > 0 {
+		n := min(target, big)
+		s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: n, TransactionDate: time.Now()})
+		target -= n
+	}
+
+	s.BeginSession(acc.ID)
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 2, TransactionDate: time.Now()})
+
+	err := s.CommitSession(acc.ID)
+	if !errors.Is(err, store.ErrBalanceOverflow) {
+		t.Fatalf("CommitSession: err = %v, want ErrBalanceOverflow", err)
+	}
+
+	// Session must still be open after a failed commit.
+	if err := s.RollbackSession(acc.ID); err != nil {
+		t.Errorf("RollbackSession after failed commit: %v", err)
+	}
+}
+
+func TestSession_NewSessionAfterCommit(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	s.BeginSession(acc.ID)
+	s.CommitSession(acc.ID)
+
+	if err := s.BeginSession(acc.ID); err != nil {
+		t.Errorf("BeginSession after commit: %v", err)
+	}
+}
+
+func TestSession_NewSessionAfterRollback(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	s.BeginSession(acc.ID)
+	s.RollbackSession(acc.ID)
+
+	if err := s.BeginSession(acc.ID); err != nil {
+		t.Errorf("BeginSession after rollback: %v", err)
+	}
+}
+
+func TestSession_TransactionOrderPreservedOnCommit(t *testing.T) {
+	// Transactions added during a session may have different TransactionDates;
+	// they must be inserted in chronological order on commit, not insertion order.
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	d1 := time.Date(2024, 1, 11, 0, 0, 0, 0, time.UTC)
+	d2 := time.Date(2024, 1, 13, 0, 0, 0, 0, time.UTC)
+	d3 := time.Date(2024, 1, 12, 0, 0, 0, 0, time.UTC)
+
+	s.BeginSession(acc.ID)
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 1, TransactionDate: d1})
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 1, TransactionDate: d2})
+	s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: 1, TransactionDate: d3})
+	s.CommitSession(acc.ID)
+
+	txs, _ := s.ListTransactions(acc.ID, store.TransactionQuery{})
+	// ListTransactions returns newest-first.
+	if len(txs) != 3 {
+		t.Fatalf("len = %d, want 3", len(txs))
+	}
+	for i := 1; i < len(txs); i++ {
+		if txs[i].TransactionDate.After(txs[i-1].TransactionDate) {
+			t.Errorf("transactions not in newest-first order at index %d", i)
+		}
+	}
+}

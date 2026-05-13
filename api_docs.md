@@ -19,6 +19,7 @@ All errors return the same envelope:
 | `400 Bad Request` | Missing or invalid field in the request body |
 | `404 Not Found` | Account ID does not exist |
 | `415 Unsupported Media Type` | `POST` request missing `Content-Type: application/json` |
+| `409 Conflict` | Transaction session state conflict — begin when a session is already open, or commit/rollback when no session is open |
 | `422 Unprocessable Entity` | Transaction would overflow the account balance, or currency does not match the account |
 | `500 Internal Server Error` | Unexpected server error — used for any store error that is not a known sentinel. Not expected in normal operation with the in-memory backend; a future persistence backend may return 500 for I/O failures. Extremely rare OS-level failures (e.g. `crypto/rand` unavailability) could also produce a 500. |
 
@@ -260,3 +261,126 @@ GET /accounts/4a2f1b3c-.../transactions?limit=2&after=7c9e2d1a-3f5b-4e8c-a2d0-1b
 When the last page is returned, `next_cursor` is omitted. If `limit` is not supplied at all, `next_cursor` is never set — pagination requires an explicit `limit`.
 
 **Note on cursor + date filter interaction:** `next_cursor` is the ID of the oldest transaction on the current page. If you pass this cursor alongside a `since` or `until` filter on the next request, the cursor establishes the starting position first and the date filter is then applied to the remaining items. This can produce an empty result if the cursor transaction sits at the `since` boundary — this is expected behaviour, not an error.
+
+---
+
+## Transaction sessions
+
+A transaction session lets you stage multiple transactions and apply them atomically. While a session is open, staged transactions are invisible — they do not appear in the balance or transaction list. On commit, all staged transactions are applied together in a single atomic step. On rollback, they are discarded entirely.
+
+Only one session may be open per account at a time. Sessions are in-memory only and are lost on server restart.
+
+---
+
+### Begin session
+
+```
+POST /accounts/{id}/begin
+```
+
+Opens a transaction session. All subsequent [Record a transaction](#record-a-transaction) calls on this account will stage the transaction rather than applying it immediately.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`**
+
+```json
+{}
+```
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Account ID is not a valid UUID |
+| `404 Not Found` | Account does not exist |
+| `409 Conflict` | A session is already open for this account |
+
+---
+
+### Commit session
+
+```
+POST /accounts/{id}/commit
+```
+
+Atomically applies all staged transactions. The balance and transaction list are updated in a single step — no partial state is ever visible. If any staged transaction would cause the balance to overflow, the entire commit is rejected and the session remains open so the client can correct and retry, or call rollback.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`**
+
+```json
+{}
+```
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Account ID is not a valid UUID |
+| `404 Not Found` | Account does not exist |
+| `409 Conflict` | No session is open for this account |
+| `422 Unprocessable Entity` | Staged transactions would overflow the balance; session remains open |
+
+---
+
+### Rollback session
+
+```
+POST /accounts/{id}/rollback
+```
+
+Discards all staged transactions. The account balance and transaction list are completely unchanged. A new session may be opened immediately afterwards.
+
+**Path parameters**
+
+| Parameter | Description |
+|-----------|-------------|
+| `id` | Account UUID |
+
+**Response `200 OK`**
+
+```json
+{}
+```
+
+**Errors**
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | Account ID is not a valid UUID |
+| `404 Not Found` | Account does not exist |
+| `409 Conflict` | No session is open for this account |
+
+---
+
+### Example flow
+
+```bash
+# Open a session
+POST /accounts/4a2f1b3c-.../begin                          → 200 {}
+
+# Stage two transactions (neither is reflected yet)
+POST /accounts/4a2f1b3c-.../transactions                   → 201
+{ "amount": 500, "currency": "GBP", "transaction_date": "2024-01-15T10:00:00Z" }
+
+POST /accounts/4a2f1b3c-.../transactions                   → 201
+{ "amount": -100, "currency": "GBP", "transaction_date": "2024-01-15T10:01:00Z" }
+
+# Balance is still frozen at its pre-session value
+GET  /accounts/4a2f1b3c-.../balance                        → 200 { "balance": 0 }
+
+# Commit: both transactions applied atomically
+POST /accounts/4a2f1b3c-.../commit                         → 200 {}
+
+GET  /accounts/4a2f1b3c-.../balance                        → 200 { "balance": 400 }
+```

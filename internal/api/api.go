@@ -44,6 +44,10 @@ func (h *Handler) RegisterRoutes(mux Mux) {
 	mux.HandleFunc("GET /accounts/{id}/balance", h.getBalance)
 	mux.HandleFunc("POST /accounts/{id}/transactions", h.idempotency.Wrap(h.addTransaction))
 	mux.HandleFunc("GET /accounts/{id}/transactions", h.listTransactions)
+
+	mux.HandleFunc("POST /accounts/{id}/begin",    h.beginSession)
+	mux.HandleFunc("POST /accounts/{id}/commit",   h.commitSession)
+	mux.HandleFunc("POST /accounts/{id}/rollback", h.rollbackSession)
 }
 
 // --- request / response types ---
@@ -235,6 +239,45 @@ func (h *Handler) listTransactions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (h *Handler) beginSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+	if !validID(id) {
+		writeErrorString(w, http.StatusBadRequest, "invalid account id")
+		return
+	}
+	if err := h.store.BeginSession(id); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+func (h *Handler) commitSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+	if !validID(id) {
+		writeErrorString(w, http.StatusBadRequest, "invalid account id")
+		return
+	}
+	if err := h.store.CommitSession(id); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+func (h *Handler) rollbackSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(paramID)
+	if !validID(id) {
+		writeErrorString(w, http.StatusBadRequest, "invalid account id")
+		return
+	}
+	if err := h.store.RollbackSession(id); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, struct{}{})
+}
+
 // --- helpers ---
 
 func writeError(w http.ResponseWriter, err error) {
@@ -249,6 +292,10 @@ func writeError(w http.ResponseWriter, err error) {
 		writeErrorString(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, store.ErrCurrencyMismatch):
 		writeErrorString(w, http.StatusUnprocessableEntity, err.Error())
+	case errors.Is(err, store.ErrSessionAlreadyOpen):
+		writeErrorString(w, http.StatusConflict, err.Error())
+	case errors.Is(err, store.ErrNoSessionOpen):
+		writeErrorString(w, http.StatusConflict, err.Error())
 	default:
 		writeErrorString(w, http.StatusInternalServerError, "internal server error")
 	}

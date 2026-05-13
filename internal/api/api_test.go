@@ -816,13 +816,16 @@ func TestListTransactions_Errors(t *testing.T) {
 type errorStore struct{ err error }
 
 func (s *errorStore) CreateAccount(string) (store.Account, error) { return store.Account{}, s.err }
-func (s *errorStore) GetBalance(string) (int64, error)          { return 0, s.err }
+func (s *errorStore) GetBalance(string) (int64, error)            { return 0, s.err }
 func (s *errorStore) AddTransaction(string, store.NewTransaction) (store.Transaction, error) {
 	return store.Transaction{}, s.err
 }
 func (s *errorStore) ListTransactions(string, store.TransactionQuery) ([]store.Transaction, error) {
 	return nil, s.err
 }
+func (s *errorStore) BeginSession(string) error    { return s.err }
+func (s *errorStore) CommitSession(string) error   { return s.err }
+func (s *errorStore) RollbackSession(string) error { return s.err }
 
 func TestWriteStoreError_AllSentinels(t *testing.T) {
 	// Ensures every sentinel in store.go is explicitly mapped in writeStoreError.
@@ -837,6 +840,8 @@ func TestWriteStoreError_AllSentinels(t *testing.T) {
 		{store.ErrCursorNotFound, http.StatusBadRequest},
 		{store.ErrBalanceOverflow, http.StatusUnprocessableEntity},
 		{store.ErrCurrencyMismatch, http.StatusUnprocessableEntity},
+		{store.ErrSessionAlreadyOpen, http.StatusConflict},
+		{store.ErrNoSessionOpen, http.StatusConflict},
 	}
 	for _, tt := range tests {
 		t.Run(tt.err.Error(), func(t *testing.T) {
@@ -852,6 +857,276 @@ func TestWriteStoreError_AllSentinels(t *testing.T) {
 			}
 			resp.Body.Close()
 		})
+	}
+}
+
+// ---- POST /accounts/{id}/begin|commit|rollback ----------------------------
+
+func mustBeginSession(t *testing.T, srv *httptest.Server, accountID string) {
+	t.Helper()
+	resp := post(t, srv, "/accounts/"+accountID+"/begin", nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("begin session: got %d, body: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+}
+
+func mustCommitSession(t *testing.T, srv *httptest.Server, accountID string) {
+	t.Helper()
+	resp := post(t, srv, "/accounts/"+accountID+"/commit", nil)
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("commit session: got %d, body: %s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+}
+
+func balance(t *testing.T, srv *httptest.Server, accountID string) int64 {
+	t.Helper()
+	var body struct{ Balance int64 `json:"balance"` }
+	decode(t, get(t, srv, "/accounts/"+accountID+"/balance"), &body)
+	return body.Balance
+}
+
+func txCount(t *testing.T, srv *httptest.Server, accountID string) int {
+	t.Helper()
+	var body struct {
+		Transactions []store.Transaction `json:"transactions"`
+	}
+	decode(t, get(t, srv, "/accounts/"+accountID+"/transactions"), &body)
+	return len(body.Transactions)
+}
+
+func TestBeginSession_Errors(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+
+	tests := []struct {
+		name       string
+		accountID  string
+		setup      func()
+		wantStatus int
+	}{
+		{
+			name:       "unknown account",
+			accountID:  "00000000-0000-4000-8000-000000000000",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:      "invalid account id",
+			accountID: "not-a-uuid",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:      "session already open",
+			accountID: id,
+			setup:     func() { mustBeginSession(t, srv, id) },
+			wantStatus: http.StatusConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.setup != nil {
+				tt.setup()
+			}
+			resp := post(t, srv, "/accounts/"+tt.accountID+"/begin", nil)
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			resp.Body.Close()
+		})
+	}
+}
+
+func TestCommitSession_Errors(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+
+	tests := []struct {
+		name       string
+		accountID  string
+		wantStatus int
+	}{
+		{"unknown account", "00000000-0000-4000-8000-000000000000", http.StatusNotFound},
+		{"invalid account id", "not-a-uuid", http.StatusBadRequest},
+		{"no session open", id, http.StatusConflict},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := post(t, srv, "/accounts/"+tt.accountID+"/commit", nil)
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			resp.Body.Close()
+		})
+	}
+}
+
+func TestRollbackSession_Errors(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+
+	tests := []struct {
+		name       string
+		accountID  string
+		wantStatus int
+	}{
+		{"unknown account", "00000000-0000-4000-8000-000000000000", http.StatusNotFound},
+		{"invalid account id", "not-a-uuid", http.StatusBadRequest},
+		{"no session open", id, http.StatusConflict},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := post(t, srv, "/accounts/"+tt.accountID+"/rollback", nil)
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			resp.Body.Close()
+		})
+	}
+}
+
+func TestSession_BufferedTransactionsHiddenBeforeCommit(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 500})
+
+	mustBeginSession(t, srv, id)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 200})
+	mustAddTransaction(t, srv, id, map[string]any{"amount": -100})
+
+	if bal := balance(t, srv, id); bal != 500 {
+		t.Errorf("balance during session = %d, want 500", bal)
+	}
+	if n := txCount(t, srv, id); n != 1 {
+		t.Errorf("transaction count during session = %d, want 1", n)
+	}
+}
+
+func TestSession_CommitAppliesAll(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 500})
+
+	mustBeginSession(t, srv, id)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 200})
+	mustAddTransaction(t, srv, id, map[string]any{"amount": -100})
+	mustCommitSession(t, srv, id)
+
+	if bal := balance(t, srv, id); bal != 600 {
+		t.Errorf("balance after commit = %d, want 600", bal)
+	}
+	if n := txCount(t, srv, id); n != 3 {
+		t.Errorf("transaction count after commit = %d, want 3", n)
+	}
+}
+
+func TestSession_RollbackDiscardsAll(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 500})
+
+	mustBeginSession(t, srv, id)
+	mustAddTransaction(t, srv, id, map[string]any{"amount": 200})
+
+	resp := post(t, srv, "/accounts/"+id+"/rollback", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rollback: got %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	if bal := balance(t, srv, id); bal != 500 {
+		t.Errorf("balance after rollback = %d, want 500", bal)
+	}
+	if n := txCount(t, srv, id); n != 1 {
+		t.Errorf("transaction count after rollback = %d, want 1", n)
+	}
+}
+
+func TestSession_CommitOverflow(t *testing.T) {
+	s := store.NewStore()
+	acc, _ := s.CreateAccount("GBP")
+
+	const big = 1_000_000_000_000_000
+	target := int64(9_223_372_036_854_775_806)
+	for target > 0 {
+		n := min(target, big)
+		s.AddTransaction(acc.ID, store.NewTransaction{Currency: "GBP", Amount: n})
+		target -= n
+	}
+
+	h := api.NewHandler(s)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	mustBeginSession(t, srv, acc.ID)
+	mustAddTransaction(t, srv, acc.ID, map[string]any{
+		"currency": "GBP", "amount": 2, "transaction_date": "2024-06-01T10:00:00Z",
+	})
+
+	// Commit must fail with 422; session remains open so rollback must succeed.
+	resp := post(t, srv, "/accounts/"+acc.ID+"/commit", nil)
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Errorf("commit overflow: status = %d, want 422", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = post(t, srv, "/accounts/"+acc.ID+"/rollback", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("rollback after failed commit: status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestSession_NewSessionAfterCommit(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+
+	mustBeginSession(t, srv, id)
+	mustCommitSession(t, srv, id)
+
+	resp := post(t, srv, "/accounts/"+id+"/begin", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("second begin after commit: status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestSession_NewSessionAfterRollback(t *testing.T) {
+	srv := newServer(t)
+	id := mustCreateAccount(t, srv)
+
+	mustBeginSession(t, srv, id)
+	post(t, srv, "/accounts/"+id+"/rollback", nil).Body.Close()
+
+	resp := post(t, srv, "/accounts/"+id+"/begin", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("second begin after rollback: status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestSession_OtherAccountUnaffected(t *testing.T) {
+	srv := newServer(t)
+	idA := mustCreateAccount(t, srv)
+	idB := mustCreateAccount(t, srv)
+
+	mustBeginSession(t, srv, idA)
+	mustAddTransaction(t, srv, idB, map[string]any{"amount": 100})
+
+	if bal := balance(t, srv, idB); bal != 100 {
+		t.Errorf("account B balance = %d, want 100; session on A must not affect B", bal)
+	}
+	if bal := balance(t, srv, idA); bal != 0 {
+		t.Errorf("account A balance = %d, want 0 while session is open", bal)
 	}
 }
 

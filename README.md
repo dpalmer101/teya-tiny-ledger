@@ -78,9 +78,27 @@ curl -s http://localhost:8080/accounts/$ACCOUNT/balance
 
 # List all three transactions
 curl -s http://localhost:8080/accounts/$ACCOUNT/transactions
+
+# Stage two transactions atomically
+curl -s -X POST http://localhost:8080/accounts/$ACCOUNT/begin
+
+curl -s -X POST http://localhost:8080/accounts/$ACCOUNT/transactions \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":200,"currency":"GBP","transaction_date":"2024-01-04T09:00:00Z"}'
+
+curl -s -X POST http://localhost:8080/accounts/$ACCOUNT/transactions \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":-50,"currency":"GBP","transaction_date":"2024-01-04T10:00:00Z"}'
+
+# Balance still shows 1300 — staged transactions are not yet visible
+curl -s http://localhost:8080/accounts/$ACCOUNT/balance
+
+# Commit: both transactions applied atomically; balance becomes 1450
+curl -s -X POST http://localhost:8080/accounts/$ACCOUNT/commit
+curl -s http://localhost:8080/accounts/$ACCOUNT/balance
 ```
 
-Full API reference: [api_docs.md](api_docs.md). 
+Full API reference: [api_docs.md](api_docs.md).
 
 ---
 
@@ -91,7 +109,7 @@ The following were explicitly excluded by the assignment or deliberately omitted
 - **Authentication and authorisation** — any caller can read or write any account; explicitly out of scope per the assignment.
 - **Persistence** — data is held in memory only and lost on restart; the assignment specifies in-memory storage.
 - **Logging and monitoring** — no structured logging, metrics, or tracing; explicitly out of scope per the assignment.
-- **Atomic transfers between accounts** — no transfer primitive; a transfer requires two separate transaction requests with no atomicity guarantee between them.
+- **Cross-account atomic transfers** — a transfer between two accounts requires two separate session commits with no atomicity guarantee across the two accounts.
 - **Point-in-time balance** — balance reflects all transactions to date; querying the balance as of a past date is not supported.
 - **Transaction amendment or cancellation** — the transaction history is append-only; corrections require a new offsetting transaction.
 - **Currency validation against ISO 4217** — currency codes are validated as three uppercase ASCII letters but not checked against the published list of valid codes.
@@ -110,6 +128,7 @@ The following were explicitly excluded by the assignment or deliberately omitted
 - **Transaction list is paginated** — cursor-based pagination allows clients to page through results without missing or duplicating transactions if new ones are added between requests.
 - **Transaction list can be filtered by date** — results can be bounded by an inclusive start and end date. Date filters and pagination compose correctly.
 - **Write operations support idempotency** — an idempotency key can be supplied on any write request. Repeating a request with the same key returns the original response without re-executing the operation, making it safe to retry on network failure. Only successful responses are cached, so a failed request can be corrected and retried with the same key.
+- **Transaction sessions** — multiple transactions can be staged with `POST /begin` and applied atomically with `POST /commit`, or discarded with `POST /rollback`. While a session is open the staged transactions are invisible to balance and list queries. If a commit would overflow the balance it is rejected in full and the session remains open. Only one session per account at a time.
 - **Thread-safe by design** — any combination of API calls may be made concurrently without corrupting state. Concurrent writes to the same account are serialised; operations on different accounts proceed independently.
 - **API security is limited** — a request size limit is applied, but validation is otherwise limited to basic format checks.
 

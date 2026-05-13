@@ -12,6 +12,8 @@ var (
 	ErrCursorNotFound   = errors.New("cursor transaction not found")
 	ErrBalanceOverflow  = errors.New("transaction would overflow the account balance")
 	ErrCurrencyMismatch = errors.New("transaction currency does not match account currency")
+	ErrSessionAlreadyOpen = errors.New("a transaction session is already open")
+	ErrNoSessionOpen      = errors.New("no transaction session is open")
 )
 
 // Store is the interface that any ledger storage backend must satisfy.
@@ -20,6 +22,9 @@ type Store interface {
 	GetBalance(accountID string) (int64, error)
 	AddTransaction(accountID string, input NewTransaction) (Transaction, error)
 	ListTransactions(accountID string, q TransactionQuery) ([]Transaction, error)
+	BeginSession(accountID string) error
+	CommitSession(accountID string) error
+	RollbackSession(accountID string) error
 }
 
 // NewTransaction is the input for recording a money movement.
